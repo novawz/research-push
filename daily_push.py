@@ -6,11 +6,13 @@ from datetime import datetime, timezone
 UTC = timezone.utc
 
 from app import (
+    AutoPushDatabaseError,
     build_runtime_prefs_from_settings,
     build_daily_push_text,
     build_digest,
     fetch_candidates,
     list_due_auto_push_subscriptions,
+    claim_auto_push_slot,
     mark_auto_push_run,
     release_auto_push_slot,
     post_webhook,
@@ -64,12 +66,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Daily paper digest push")
     parser.add_argument("--prefs", default="", help="Path to user preferences JSON")
     parser.add_argument("--all-due", action="store_true", help="Process all due multi-user auto-push subscriptions")
+    parser.add_argument("--check", "--dry-run", action="store_true", help="Read the subscription database and count due subscriptions without claiming, writing, or delivering")
     parser.add_argument("--limit", type=int, default=0, help="Max subscriptions to process in --all-due mode")
     parser.add_argument("--webhook", default="", help="Webhook URL (fallback to WEBHOOK_URL env)")
     args = parser.parse_args()
 
-    if args.all_due:
-        due = list_due_auto_push_subscriptions()
+    if args.limit < 0:
+        parser.error("--limit must be zero or positive.")
+
+    if args.all_due or args.check:
+        try:
+            due = list_due_auto_push_subscriptions()
+        except AutoPushDatabaseError as exc:
+            raise SystemExit(f"Auto-push database check failed: {exc}") from None
+        if args.check:
+            print(f"Database check succeeded. due={len(due)}; no subscriptions claimed or delivered.")
+            return
         if args.limit > 0:
             due = due[: args.limit]
         if not due:
@@ -79,15 +91,25 @@ def main() -> None:
         failed = 0
         for item in due:
             sid = item["subscriber_id"]
-            ok, msg = run_push_once(settings=item["settings"])
-            if ok:
-                mark_auto_push_run(sid, item["local_date"], "")
-                success += 1
-                print(f"[ok] {sid[:8]} {item['timezone']} {item['local_time']}")
-            else:
-                release_auto_push_slot(sid, item["local_date"], msg)
-                failed += 1
-                print(f"[failed] {sid[:8]}: {msg}")
+            try:
+                # Claim immediately before processing, after applying --limit.
+                if not claim_auto_push_slot(sid, item["local_date"]):
+                    continue
+                try:
+                    ok, msg = run_push_once(settings=item["settings"])
+                except Exception:
+                    # Avoid leaking settings/credentials in third-party errors.
+                    ok, msg = False, "Unexpected error while building or delivering digest."
+                if ok:
+                    mark_auto_push_run(sid, item["local_date"], "")
+                    success += 1
+                    print(f"[ok] {sid[:8]} {item['timezone']} {item['local_time']}")
+                else:
+                    release_auto_push_slot(sid, item["local_date"], msg)
+                    failed += 1
+                    print(f"[failed] {sid[:8]}: {msg}")
+            except AutoPushDatabaseError as exc:
+                raise SystemExit(f"Auto-push database operation failed: {exc}") from None
         if failed:
             raise SystemExit(f"Completed with failures. success={success}, failed={failed}")
         print(f"Completed. success={success}, failed=0")

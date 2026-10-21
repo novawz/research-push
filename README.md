@@ -50,3 +50,44 @@ Without an API key, the app still works, but AI-specific parts are hidden or dow
 - No papers found: widen the time range and reduce keyword filters.
 - Slack received nothing: check webhook URL validity and channel permissions.
 - Webhook leaked: revoke/rotate it in Slack immediately, then update the app.
+
+## 5. Automatic Push Operations
+
+GitHub Actions checks for due subscriptions every five minutes (`2/5 * * * *`).
+Each subscription keeps its saved local time, timezone, and daily/Monday schedule.
+The workflow allows delivery up to 60 minutes after the saved time, within the
+same local calendar day, to tolerate GitHub scheduling delays. Other callers retain the 15-minute default unless they
+set `AUTO_PUSH_GRACE_MINUTES`. GitHub schedules can be delayed or dropped, and
+public-repository schedules can be disabled after 60 days without activity.
+
+Set the existing `AUTO_PUSH_DATABASE_URL` GitHub secret to the subscription
+database. No GitHub PAT is needed for native scheduling. After deploying this
+workflow, disable the old `auto_push_dispatch_each_minute` Supabase cron job
+(the removal SQL is in `supabase/sql/remove_auto_push_cron.sql`) and revoke its
+dispatch PAT. Do not install the legacy `setup_auto_push_cron.sql` for this setup.
+
+Manual workflow runs default to **check_only**, which executes:
+
+```sh
+python daily_push.py --check
+```
+
+`--check` (also `--dry-run`) verifies that the existing subscription table is
+readable and prints only the number currently due. It uses a read-only database
+connection, does not create the table, claim subscriptions, fetch papers, or
+send webhooks. Missing schema, missing configuration, and database failures exit
+nonzero. PostgreSQL connections have a 10-second connection timeout, a
+15-second statement timeout, and a 5-second lock timeout.
+
+Scheduled runs and legacy repository dispatches process due subscriptions.
+Uncheck **check_only** only when a manual delivery is intended. Each subscription
+is claimed immediately before processing, after applying `--limit`; a process
+interruption cannot claim later subscriptions it has not started. An interruption
+during a delivery can still leave that particular subscription marked for the
+day, so check delivery evidence before manually resetting its status.
+
+Run the offline regression tests with:
+
+```sh
+python -m unittest discover -s tests -v
+```

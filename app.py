@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import closing, contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -2186,6 +2187,28 @@ def auto_push_backend_reason() -> str:
     return ""
 
 
+class AutoPushDatabaseError(RuntimeError):
+    """A database failure that is safe to report without connection details."""
+
+
+@contextmanager
+def auto_push_postgres_connection(*, readonly: bool = False):
+    if psycopg2 is None:
+        raise AutoPushDatabaseError("psycopg2 is not installed.")
+    conn = psycopg2.connect(AUTO_PUSH_DATABASE_URL, connect_timeout=10)
+    try:
+        conn.set_session(readonly=readonly)
+        with conn:
+            with conn.cursor() as cur:
+                # Transaction-local settings preserve any options in the DSN.
+                cur.execute("SET LOCAL statement_timeout = '15s'")
+                cur.execute("SET LOCAL lock_timeout = '5s'")
+            yield conn
+    finally:
+        # psycopg2's connection context commits/rolls back but does not close.
+        conn.close()
+
+
 def init_auto_push_db() -> None:
     if not AUTO_PUSH_ENABLED:
         return
@@ -2193,7 +2216,7 @@ def init_auto_push_db() -> None:
         if psycopg2 is None:
             return
         try:
-            with psycopg2.connect(AUTO_PUSH_DATABASE_URL) as conn:
+            with auto_push_postgres_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -2264,7 +2287,7 @@ def upsert_auto_push_subscription(subscriber_id: str, settings: dict[str, Any], 
         if psycopg2 is None:
             return False, "psycopg2 is not installed."
         try:
-            with psycopg2.connect(AUTO_PUSH_DATABASE_URL) as conn:
+            with auto_push_postgres_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -2351,22 +2374,23 @@ def upsert_auto_push_subscription(subscriber_id: str, settings: dict[str, Any], 
 
 
 def list_due_auto_push_subscriptions(now_dt: datetime | None = None) -> list[dict[str, Any]]:
+    """Read due subscriptions without creating tables, claiming slots, or sending."""
     if not AUTO_PUSH_ENABLED:
-        return []
-    init_auto_push_db()
+        raise AutoPushDatabaseError(auto_push_backend_reason() or "Auto-push backend unavailable.")
     now_dt = now_dt or now_utc()
     rows: list[dict[str, Any]] = []
     if AUTO_PUSH_BACKEND == "postgres":
         if psycopg2 is None:
-            return []
+            raise AutoPushDatabaseError("psycopg2 is not installed.")
         try:
-            with psycopg2.connect(AUTO_PUSH_DATABASE_URL) as conn:
+            with auto_push_postgres_connection(readonly=True) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
                         SELECT subscriber_id, schedule, custom_days, push_time, timezone, settings_json, last_run_local_date
                         FROM auto_push_subscriptions
                         WHERE enabled = 1
+                        ORDER BY subscriber_id
                         """
                     )
                     for row in cur.fetchall():
@@ -2382,23 +2406,25 @@ def list_due_auto_push_subscriptions(now_dt: datetime | None = None) -> list[dic
                             }
                         )
         except Exception:
-            return []
+            raise AutoPushDatabaseError("Cannot read auto-push subscriptions; check database connectivity and schema.") from None
     elif AUTO_PUSH_BACKEND == "sqlite":
         try:
-            with sqlite3.connect(AUTO_PUSH_DB_FILE) as conn:
+            # mode=ro also prevents --check from creating a missing database.
+            with closing(sqlite3.connect(f"{AUTO_PUSH_DB_FILE.resolve().as_uri()}?mode=ro", uri=True)) as conn:
                 conn.row_factory = sqlite3.Row
                 raw_rows = conn.execute(
                     """
                     SELECT subscriber_id, schedule, custom_days, push_time, timezone, settings_json, last_run_local_date
                     FROM auto_push_subscriptions
                     WHERE enabled = 1
+                    ORDER BY subscriber_id
                     """
                 ).fetchall()
                 rows = [dict(r) for r in raw_rows]
         except Exception:
-            return []
+            raise AutoPushDatabaseError("Cannot read auto-push subscriptions; check database connectivity and schema.") from None
     else:
-        return []
+        raise AutoPushDatabaseError("Auto-push backend unavailable.")
 
     due: list[dict[str, Any]] = []
     grace_default = 15
@@ -2435,8 +2461,6 @@ def list_due_auto_push_subscriptions(now_dt: datetime | None = None) -> list[dic
                 continue
         except Exception:
             continue
-        if not claim_auto_push_slot(str(row["subscriber_id"]), local_date):
-            continue
         due.append(
             {
                 "subscriber_id": str(row["subscriber_id"]),
@@ -2458,7 +2482,7 @@ def mark_auto_push_run(subscriber_id: str, local_date: str | None, error: str = 
         if psycopg2 is None:
             return
         try:
-            with psycopg2.connect(AUTO_PUSH_DATABASE_URL) as conn:
+            with auto_push_postgres_connection() as conn:
                 with conn.cursor() as cur:
                     if local_date:
                         cur.execute(
@@ -2480,7 +2504,7 @@ def mark_auto_push_run(subscriber_id: str, local_date: str | None, error: str = 
                         )
             return
         except Exception:
-            return
+            raise AutoPushDatabaseError("Cannot record auto-push delivery status.") from None
     if AUTO_PUSH_BACKEND != "sqlite":
         return
     try:
@@ -2504,7 +2528,7 @@ def mark_auto_push_run(subscriber_id: str, local_date: str | None, error: str = 
                     (err, now_text, subscriber_id),
                 )
     except Exception:
-        return
+        raise AutoPushDatabaseError("Cannot record auto-push delivery status.") from None
 
 
 def claim_auto_push_slot(subscriber_id: str, local_date: str) -> bool:
@@ -2519,7 +2543,7 @@ def claim_auto_push_slot(subscriber_id: str, local_date: str) -> bool:
         if psycopg2 is None:
             return False
         try:
-            with psycopg2.connect(AUTO_PUSH_DATABASE_URL) as conn:
+            with auto_push_postgres_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -2533,7 +2557,7 @@ def claim_auto_push_slot(subscriber_id: str, local_date: str) -> bool:
                     )
                     return (cur.rowcount or 0) > 0
         except Exception:
-            return False
+            raise AutoPushDatabaseError("Cannot claim auto-push subscription.") from None
     if AUTO_PUSH_BACKEND != "sqlite":
         return False
     try:
@@ -2550,7 +2574,7 @@ def claim_auto_push_slot(subscriber_id: str, local_date: str) -> bool:
             )
             return int(cur.rowcount or 0) > 0
     except Exception:
-        return False
+        raise AutoPushDatabaseError("Cannot claim auto-push subscription.") from None
 
 
 def release_auto_push_slot(subscriber_id: str, local_date: str, error: str = "") -> None:
@@ -2566,7 +2590,7 @@ def release_auto_push_slot(subscriber_id: str, local_date: str, error: str = "")
         if psycopg2 is None:
             return
         try:
-            with psycopg2.connect(AUTO_PUSH_DATABASE_URL) as conn:
+            with auto_push_postgres_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -2579,7 +2603,7 @@ def release_auto_push_slot(subscriber_id: str, local_date: str, error: str = "")
                     )
             return
         except Exception:
-            return
+            raise AutoPushDatabaseError("Cannot release auto-push subscription.") from None
     if AUTO_PUSH_BACKEND != "sqlite":
         return
     try:
@@ -2594,7 +2618,7 @@ def release_auto_push_slot(subscriber_id: str, local_date: str, error: str = "")
                 (err, now_text, sid, day),
             )
     except Exception:
-        return
+        raise AutoPushDatabaseError("Cannot release auto-push subscription.") from None
 
 
 def fallback_feed_summary(p: Paper, sc: dict[str, int], lang: str = "zh") -> str:

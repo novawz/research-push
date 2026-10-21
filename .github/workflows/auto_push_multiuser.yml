@@ -1,9 +1,19 @@
 name: Multi-User Auto Push
 
 on:
+  schedule:
+    - cron: '2/5 * * * *'
   workflow_dispatch:
+    inputs:
+      check_only:
+        description: 'Only check database connectivity and count due subscriptions (no delivery)'
+        type: boolean
+        default: true
   repository_dispatch:
     types: [supabase-auto-push]
+
+permissions:
+  contents: read
 
 jobs:
   run-auto-push:
@@ -30,7 +40,10 @@ jobs:
         env:
           AUTO_PUSH_DATABASE_URL: ${{ secrets.AUTO_PUSH_DATABASE_URL }}
           AUTO_PUSH_MULTIUSER: "1"
+          # Allow for GitHub schedule delays without changing subscription times.
+          AUTO_PUSH_GRACE_MINUTES: "60"
           SERVER_PERSISTENCE: "0"
+          CHECK_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.check_only }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -40,4 +53,8 @@ jobs:
             echo "Missing GitHub secret: AUTO_PUSH_DATABASE_URL"
             exit 1
           fi
-          python daily_push.py --all-due
+          if [ "${CHECK_ONLY}" = "true" ]; then
+            python daily_push.py --check
+          else
+            python daily_push.py --all-due
+          fi
