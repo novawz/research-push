@@ -70,7 +70,9 @@ The workflow also sets this project's Supabase reference and IPv4 session pooler
 host. The connection helper only rewrites a matching direct Supabase hostname;
 an already matching project/session-pooler connection stays on that target.
 It preserves the existing password and database options, requires the `postgres`
-database and port 5432, and uses TLS (`require` or an existing stricter mode).
+database and destination port 5432, and uses TLS (`require` or an existing stricter mode).
+The known legacy direct-host/6543-port combination is corrected to session port
+5432 only when the original hostname matches this exact project.
 Mismatched projects, usernames, and alternate libpq routes are rejected before
 connecting. Callers with neither override setting keep their original DSN;
 setting only one is a configuration error.

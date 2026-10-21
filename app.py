@@ -2311,10 +2311,13 @@ def auto_push_postgres_connect_kwargs() -> dict[str, Any]:
     user = params.get("user", "")
     suffix = f".{project_ref}"
     base_user = user[:-len(suffix)] if user.endswith(suffix) else user
+    # Repair the legacy direct-host/transaction-port mix-up only after matching
+    # this exact project. The destination remains the session pooler on 5432.
+    allowed_ports = {"5432", "6543"} if host == f"db.{project_ref}.supabase.co" else {"5432"}
     if (
         host not in {f"db.{project_ref}.supabase.co", pooler_host}
         or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", base_user)
-        or params.get("port", "5432") != "5432"
+        or params.get("port", "5432") not in allowed_ports
         or params.get("dbname") != "postgres"
         or (host == pooler_host and not user.endswith(suffix))
     ):

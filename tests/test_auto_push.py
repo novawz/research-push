@@ -260,6 +260,13 @@ class PostgresTests(unittest.TestCase):
         app.list_due_auto_push_subscriptions(NOW)
         self.driver.connect.assert_called_once_with(**dict(original, sslmode="require", connect_timeout=10))
 
+    def test_legacy_direct_host_with_transaction_port_uses_verified_session_pooler(self):
+        original = self.enable_pooler_override(port="6543")
+        app.list_due_auto_push_subscriptions(NOW)
+        expected = dict(original, host="aws-0-us-west-2.pooler.supabase.com", port="5432",
+                        user="postgres.ypnykiqxwixaaixdcjbc", connect_timeout=10)
+        self.driver.connect.assert_called_once_with(**expected)
+
     def test_override_rejects_unverified_targets_before_connecting(self):
         cases = [
             {"host": "db.otherproject1234567890.supabase.co"},
@@ -268,7 +275,8 @@ class PostgresTests(unittest.TestCase):
             {"host": "aws-1-us-east-1.pooler.supabase.com", "user": "postgres.ypnykiqxwixaaixdcjbc"},
             {"host": "aws-0-us-west-2.pooler.supabase.com", "user": "postgres"},
             {"user": "postgres.wrongproject"}, {"user": ""},
-            {"port": "6543"}, {"dbname": "private-db"},
+            {"port": "6544"}, {"dbname": "private-db"},
+            {"host": "aws-0-us-west-2.pooler.supabase.com", "user": "postgres.ypnykiqxwixaaixdcjbc", "port": "6543"},
             {"hostaddr": "192.0.2.1"}, {"service": "private-service"},
         ]
         for changes in cases:
