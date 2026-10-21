@@ -2258,6 +2258,34 @@ def auto_push_database_diagnostic(exc: Exception) -> str:
     return f"type={error_type}; sqlstate={sqlstate}; category={category}"
 
 
+def auto_push_supabase_target_diagnostic(params: dict[str, str], project_ref: str, pooler_host: str) -> str:
+    """Describe mismatches using fixed labels, never connection values."""
+    host = params.get("host", "")
+    user = params.get("user", "")
+    suffix = f".{project_ref}"
+    if host == f"db.{project_ref}.supabase.co":
+        host_kind = "expected_direct"
+    elif host == pooler_host:
+        host_kind = "expected_pooler"
+    elif re.fullmatch(r"db\.[a-z0-9]{20}\.supabase\.co", host):
+        host_kind = "other_supabase_direct"
+    elif re.fullmatch(r"aws-[0-9]+-[a-z0-9-]+\.pooler\.supabase\.com", host):
+        host_kind = "other_supabase_pooler"
+    else:
+        host_kind = "other"
+    if user.endswith(suffix) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", user[:-len(suffix)]):
+        user_scope = "expected_project"
+    elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", user):
+        user_scope = "base"
+    elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.[a-z0-9]{20}", user):
+        user_scope = "other_project"
+    else:
+        user_scope = "invalid"
+    port_kind = {"5432": "default5432", "6543": "transaction6543"}.get(params.get("port", "5432"), "other")
+    database_match = "true" if params.get("dbname") == "postgres" else "false"
+    return f"host_kind={host_kind}; user_scope={user_scope}; port_kind={port_kind}; database_match={database_match}"
+
+
 def auto_push_postgres_connect_kwargs() -> dict[str, Any]:
     """Opt in to a verified project's session pooler without exposing the DSN."""
     if psycopg2 is None:
@@ -2290,7 +2318,8 @@ def auto_push_postgres_connect_kwargs() -> dict[str, Any]:
         or params.get("dbname") != "postgres"
         or (host == pooler_host and not user.endswith(suffix))
     ):
-        raise AutoPushDatabaseError("Supabase session pooler override target mismatch.")
+        diagnostic = auto_push_supabase_target_diagnostic(params, project_ref, pooler_host)
+        raise AutoPushDatabaseError(f"Supabase session pooler override target mismatch ({diagnostic}).")
     params.update(host=pooler_host, port="5432", user=f"{base_user}{suffix}", connect_timeout=10)
     if params.get("sslmode") not in {"verify-ca", "verify-full"}:
         params["sslmode"] = "require"

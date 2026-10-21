@@ -303,6 +303,16 @@ class PostgresTests(unittest.TestCase):
                          "Auto-push database check failed: Cannot parse auto-push database connection configuration.")
         self.driver.connect.assert_not_called()
 
+    def test_target_mismatch_flags_reach_cli_without_exposing_values(self):
+        self.enable_pooler_override(user="postgres.abcdefghijklmnopqrst", port="6543")
+        with patch("sys.argv", ["daily_push.py", "--check"]):
+            with self.assertRaises(SystemExit) as raised:
+                daily_push.main()
+        self.assertEqual(str(raised.exception),
+                         "Auto-push database check failed: Supabase session pooler override target mismatch "
+                         "(host_kind=expected_direct; user_scope=other_project; port_kind=transaction6543; database_match=true).")
+        self.driver.connect.assert_not_called()
+
     def test_write_operations_use_the_same_bounded_connection_helper(self):
         operations = [
             lambda: app.init_auto_push_db(),
@@ -327,6 +337,29 @@ class PostgresTests(unittest.TestCase):
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_target_mismatch_diagnostics_use_only_fixed_flags(self):
+        project_ref = "ypnykiqxwixaaixdcjbc"
+        pooler_host = "aws-0-us-west-2.pooler.supabase.com"
+        cases = [
+            ({"host": f"db.{project_ref}.supabase.co", "user": "postgres", "dbname": "postgres"},
+             "expected_direct", "base", "default5432", "true"),
+            ({"host": pooler_host, "user": f"postgres.{project_ref}", "port": "6543", "dbname": "postgres"},
+             "expected_pooler", "expected_project", "transaction6543", "true"),
+            ({"host": "db.abcdefghijklmnopqrst.supabase.co", "user": "postgres.abcdefghijklmnopqrst", "port": "15432", "dbname": "private-db"},
+             "other_supabase_direct", "other_project", "other", "false"),
+            ({"host": "aws-1-us-east-1.pooler.supabase.com", "user": "private-invalid-user", "dbname": "private-db"},
+             "other_supabase_pooler", "invalid", "default5432", "false"),
+            ({"host": "private-host.invalid", "user": "", "port": "private-port", "dbname": "private-db"},
+             "other", "invalid", "other", "false"),
+        ]
+        for params, host_kind, user_scope, port_kind, database_match in cases:
+            with self.subTest(host_kind=host_kind, user_scope=user_scope):
+                params["password"] = "fake-sensitive-password"
+                self.assertEqual(
+                    app.auto_push_supabase_target_diagnostic(params, project_ref, pooler_host),
+                    f"host_kind={host_kind}; user_scope={user_scope}; port_kind={port_kind}; database_match={database_match}",
+                )
+
     def test_message_categories_never_return_connection_details(self):
         cases = [
             ("password authentication failed", "authentication"),
