@@ -171,6 +171,11 @@ class PostgresTests(unittest.TestCase):
         self.cursor = self.conn.cursor.return_value.__enter__.return_value
         self.cursor.fetchall.return_value = []
         self.cursor.rowcount = 1
+        self.stack.enter_context(patch.dict(os.environ, {
+            "AUTO_PUSH_SUPABASE_PROJECT_REF": "",
+            "AUTO_PUSH_SUPABASE_SESSION_POOLER_HOST": "",
+            "PGHOSTADDR": "", "PGSERVICE": "", "PGSERVICEFILE": "",
+        }))
         for name, value in {
             "AUTO_PUSH_ENABLED": True,
             "AUTO_PUSH_MULTIUSER": True,
@@ -182,7 +187,7 @@ class PostgresTests(unittest.TestCase):
 
     def test_read_connection_has_timeouts_readonly_transaction_and_is_closed(self):
         self.assertEqual(app.list_due_auto_push_subscriptions(NOW), [])
-        self.driver.connect.assert_called_once_with("postgresql://test.invalid/example", connect_timeout=10)
+        self.driver.connect.assert_called_once_with(dsn="postgresql://test.invalid/example", connect_timeout=10)
         self.conn.set_session.assert_called_once_with(readonly=True)
         statements = [call.args[0] for call in self.cursor.execute.call_args_list]
         self.assertEqual(statements[:2], ["SET LOCAL statement_timeout = '15s'", "SET LOCAL lock_timeout = '5s'"])
@@ -225,6 +230,78 @@ class PostgresTests(unittest.TestCase):
         self.assertIn("type=OperationalError; sqlstate=28P01; category=authentication", output)
         for value in ["private-user", "fake-password", "private-host", "private-db", "postgresql://"]:
             self.assertNotIn(value, output)
+
+    def enable_pooler_override(self, **changes):
+        self.stack.enter_context(patch.dict(os.environ, {
+            "AUTO_PUSH_SUPABASE_PROJECT_REF": "ypnykiqxwixaaixdcjbc",
+            "AUTO_PUSH_SUPABASE_SESSION_POOLER_HOST": "aws-0-us-west-2.pooler.supabase.com",
+        }))
+        params = {
+            "host": "db.ypnykiqxwixaaixdcjbc.supabase.co", "port": "5432",
+            "user": "postgres", "dbname": "postgres", "password": "fake:p@ss/%word",
+            "sslmode": "verify-full", "options": "-c search_path=public",
+        }
+        params.update(changes)
+        self.driver.extensions.parse_dsn.side_effect = lambda _: dict(params)
+        return params
+
+    def test_direct_supabase_override_preserves_password_and_options(self):
+        original = self.enable_pooler_override()
+        app.list_due_auto_push_subscriptions(NOW)
+        self.driver.extensions.parse_dsn.assert_called_once_with(app.AUTO_PUSH_DATABASE_URL)
+        expected = dict(original, host="aws-0-us-west-2.pooler.supabase.com", port="5432",
+                        user="postgres.ypnykiqxwixaaixdcjbc", connect_timeout=10)
+        self.driver.connect.assert_called_once_with(**expected)
+        self.conn.set_session.assert_called_once_with(readonly=True)
+
+    def test_matching_pooler_target_is_idempotent_and_requires_tls(self):
+        original = self.enable_pooler_override(host="aws-0-us-west-2.pooler.supabase.com",
+                                              user="postgres.ypnykiqxwixaaixdcjbc", sslmode="prefer")
+        app.list_due_auto_push_subscriptions(NOW)
+        self.driver.connect.assert_called_once_with(**dict(original, sslmode="require", connect_timeout=10))
+
+    def test_override_rejects_unverified_targets_before_connecting(self):
+        cases = [
+            {"host": "db.otherproject1234567890.supabase.co"},
+            {"host": "private-host.invalid"},
+            {"host": "db.ypnykiqxwixaaixdcjbc.supabase.co,private-host.invalid"},
+            {"host": "aws-1-us-east-1.pooler.supabase.com", "user": "postgres.ypnykiqxwixaaixdcjbc"},
+            {"host": "aws-0-us-west-2.pooler.supabase.com", "user": "postgres"},
+            {"user": "postgres.wrongproject"}, {"user": ""},
+            {"port": "6543"}, {"dbname": "private-db"},
+            {"hostaddr": "192.0.2.1"}, {"service": "private-service"},
+        ]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                self.enable_pooler_override(**changes)
+                with self.assertRaises(app.AutoPushDatabaseError) as raised:
+                    app.list_due_auto_push_subscriptions(NOW)
+                self.driver.connect.assert_not_called()
+                output = str(raised.exception)
+                for secret in ["fake:p@ss/%word", "private-host", "private-db", "private-service"]:
+                    self.assertNotIn(secret, output)
+
+    def test_override_rejects_environment_routes_and_partial_configuration(self):
+        self.enable_pooler_override()
+        for key in ["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"]:
+            with self.subTest(key=key), patch.dict(os.environ, {key: "private-route"}):
+                with self.assertRaises(app.AutoPushDatabaseError):
+                    app.list_due_auto_push_subscriptions(NOW)
+        for key in ["AUTO_PUSH_SUPABASE_PROJECT_REF", "AUTO_PUSH_SUPABASE_SESSION_POOLER_HOST"]:
+            with self.subTest(key=key), patch.dict(os.environ, {key: ""}):
+                with self.assertRaises(app.AutoPushDatabaseError):
+                    app.list_due_auto_push_subscriptions(NOW)
+        self.driver.connect.assert_not_called()
+
+    def test_dsn_parse_error_is_sanitized_before_connecting(self):
+        self.enable_pooler_override()
+        self.driver.extensions.parse_dsn.side_effect = ValueError("private-host fake-password private-user")
+        with patch("sys.argv", ["daily_push.py", "--check"]):
+            with self.assertRaises(SystemExit) as raised:
+                daily_push.main()
+        self.assertEqual(str(raised.exception),
+                         "Auto-push database check failed: Cannot parse auto-push database connection configuration.")
+        self.driver.connect.assert_not_called()
 
     def test_write_operations_use_the_same_bounded_connection_helper(self):
         operations = [

@@ -66,6 +66,15 @@ workflow, disable the old `auto_push_dispatch_each_minute` Supabase cron job
 (the removal SQL is in `supabase/sql/remove_auto_push_cron.sql`) and revoke its
 dispatch PAT. Do not install the legacy `setup_auto_push_cron.sql` for this setup.
 
+The workflow also sets this project's Supabase reference and IPv4 session pooler
+host. The connection helper only rewrites a matching direct Supabase hostname;
+an already matching project/session-pooler connection stays on that target.
+It preserves the existing password and database options, requires the `postgres`
+database and port 5432, and uses TLS (`require` or an existing stricter mode).
+Mismatched projects, usernames, and alternate libpq routes are rejected before
+connecting. Callers with neither override setting keep their original DSN;
+setting only one is a configuration error.
+
 Manual workflow runs default to **check_only**, which executes:
 
 ```sh

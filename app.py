@@ -2258,11 +2258,49 @@ def auto_push_database_diagnostic(exc: Exception) -> str:
     return f"type={error_type}; sqlstate={sqlstate}; category={category}"
 
 
-@contextmanager
-def auto_push_postgres_connection(*, readonly: bool = False):
+def auto_push_postgres_connect_kwargs() -> dict[str, Any]:
+    """Opt in to a verified project's session pooler without exposing the DSN."""
     if psycopg2 is None:
         raise AutoPushDatabaseError("psycopg2 is not installed.")
-    conn = psycopg2.connect(AUTO_PUSH_DATABASE_URL, connect_timeout=10)
+    project_ref = os.getenv("AUTO_PUSH_SUPABASE_PROJECT_REF", "")
+    pooler_host = os.getenv("AUTO_PUSH_SUPABASE_SESSION_POOLER_HOST", "")
+    if not project_ref and not pooler_host:
+        return {"dsn": AUTO_PUSH_DATABASE_URL, "connect_timeout": 10}
+    if not re.fullmatch(r"[a-z0-9]{20}", project_ref) or not re.fullmatch(
+        r"aws-[0-9]+-[a-z0-9-]+\.pooler\.supabase\.com", pooler_host
+    ):
+        raise AutoPushDatabaseError("Invalid Supabase session pooler override configuration.")
+    try:
+        params = psycopg2.extensions.parse_dsn(AUTO_PUSH_DATABASE_URL)
+    except Exception:
+        raise AutoPushDatabaseError("Cannot parse auto-push database connection configuration.") from None
+    # Alternate libpq routes could bypass the checked hostname. Fail closed.
+    if any(params.get(key) for key in ("hostaddr", "service")) or any(
+        os.getenv(key) for key in ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE")
+    ):
+        raise AutoPushDatabaseError("Supabase session pooler override rejects alternate connection routes.")
+    host = params.get("host", "")
+    user = params.get("user", "")
+    suffix = f".{project_ref}"
+    base_user = user[:-len(suffix)] if user.endswith(suffix) else user
+    if (
+        host not in {f"db.{project_ref}.supabase.co", pooler_host}
+        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", base_user)
+        or params.get("port", "5432") != "5432"
+        or params.get("dbname") != "postgres"
+        or (host == pooler_host and not user.endswith(suffix))
+    ):
+        raise AutoPushDatabaseError("Supabase session pooler override target mismatch.")
+    params.update(host=pooler_host, port="5432", user=f"{base_user}{suffix}", connect_timeout=10)
+    if params.get("sslmode") not in {"verify-ca", "verify-full"}:
+        params["sslmode"] = "require"
+    return params
+
+
+@contextmanager
+def auto_push_postgres_connection(*, readonly: bool = False):
+    connect_kwargs = auto_push_postgres_connect_kwargs()
+    conn = psycopg2.connect(**connect_kwargs)
     try:
         conn.set_session(readonly=readonly)
         with conn:
@@ -2472,6 +2510,8 @@ def list_due_auto_push_subscriptions(now_dt: datetime | None = None) -> list[dic
                                 "last_run_local_date": row[6],
                             }
                         )
+        except AutoPushDatabaseError:
+            raise
         except Exception as exc:
             raise AutoPushDatabaseError(f"Cannot read auto-push subscriptions ({auto_push_database_diagnostic(exc)}).") from None
     elif AUTO_PUSH_BACKEND == "sqlite":

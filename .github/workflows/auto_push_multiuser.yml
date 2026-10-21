@@ -39,6 +39,9 @@ jobs:
       - name: Run due subscriptions
         env:
           AUTO_PUSH_DATABASE_URL: ${{ secrets.AUTO_PUSH_DATABASE_URL }}
+          # GitHub-hosted runners use this project's IPv4 session pooler.
+          AUTO_PUSH_SUPABASE_PROJECT_REF: "ypnykiqxwixaaixdcjbc"
+          AUTO_PUSH_SUPABASE_SESSION_POOLER_HOST: "aws-0-us-west-2.pooler.supabase.com"
           AUTO_PUSH_MULTIUSER: "1"
           # Allow for GitHub schedule delays without changing subscription times.
           AUTO_PUSH_GRACE_MINUTES: "60"
