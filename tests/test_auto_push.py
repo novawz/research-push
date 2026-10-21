@@ -212,6 +212,20 @@ class PostgresTests(unittest.TestCase):
             with self.assertRaises(app.AutoPushDatabaseError):
                 app.list_due_auto_push_subscriptions(NOW)
 
+    def test_check_failure_reports_only_safe_diagnostics(self):
+        error = sqlite3.OperationalError(
+            "password authentication failed; postgresql://private-user:fake-password@private-host/private-db"
+        )
+        error.pgcode = "28P01"
+        self.driver.connect.side_effect = error
+        with patch("sys.argv", ["daily_push.py", "--check"]):
+            with self.assertRaises(SystemExit) as raised:
+                daily_push.main()
+        output = str(raised.exception)
+        self.assertIn("type=OperationalError; sqlstate=28P01; category=authentication", output)
+        for value in ["private-user", "fake-password", "private-host", "private-db", "postgresql://"]:
+            self.assertNotIn(value, output)
+
     def test_write_operations_use_the_same_bounded_connection_helper(self):
         operations = [
             lambda: app.init_auto_push_db(),
@@ -233,6 +247,77 @@ class PostgresTests(unittest.TestCase):
                 statements = [call.args[0] for call in self.cursor.execute.call_args_list]
                 self.assertEqual(statements.count("SET LOCAL statement_timeout = '15s'"), self.driver.connect.call_count)
                 self.assertEqual(statements.count("SET LOCAL lock_timeout = '5s'"), self.driver.connect.call_count)
+
+
+class DiagnosticTests(unittest.TestCase):
+    def test_message_categories_never_return_connection_details(self):
+        cases = [
+            ("password authentication failed", "authentication"),
+            ("Tenant or user not found", "authentication"),
+            ("could not translate host name", "dns"),
+            ("SSL connection error: certificate verify failed", "tls"),
+            ("Connection refused", "refused_or_unreachable"),
+            ("Network is unreachable", "refused_or_unreachable"),
+            ("timeout expired", "timeout"),
+            ("canceling statement due to lock timeout", "lock_timeout"),
+            ("no such table", "schema"),
+            ("attempt to write a readonly database", "read_only"),
+            ("permission denied", "permission"),
+            ("Max client connections reached", "connection_limit"),
+            ("database system is starting up", "database_unavailable"),
+            ("server closed the connection unexpectedly", "connection_failure"),
+            ("invalid dsn: missing '='", "configuration"),
+            ("unable to open database file", "file_unavailable"),
+            ("unrecognized error", "unknown"),
+        ]
+        for message, category in cases:
+            with self.subTest(category=category, message=message):
+                error = sqlite3.OperationalError(
+                    message + " postgresql://private-user:fake-password@private-host/private-db"
+                )
+                self.assertEqual(
+                    app.auto_push_database_diagnostic(error),
+                    f"type=OperationalError; sqlstate=unavailable; category={category}",
+                )
+
+    def test_sqlstate_classification_and_validation(self):
+        cases = [
+            ("28P01", "authentication"), ("28000", "authentication"),
+            ("42P01", "schema"), ("3F000", "schema"), ("42703", "schema"),
+            ("25006", "read_only"), ("42501", "permission"),
+            ("55P03", "lock_timeout"), ("53300", "connection_limit"),
+            ("3D000", "database_missing"), ("57P03", "database_unavailable"),
+            ("25001", "transaction_state"), ("08006", "connection_failure"),
+            ("57014", "query_canceled"),
+        ]
+        for sqlstate, category in cases:
+            with self.subTest(sqlstate=sqlstate):
+                error = sqlite3.OperationalError("fake-password private-host private-user")
+                error.pgcode = sqlstate
+                self.assertEqual(app.auto_push_database_diagnostic(error),
+                                 f"type=OperationalError; sqlstate={sqlstate}; category={category}")
+        for invalid in [None, 28000, "28p01", "28P01\n", "private-password", "28P01 extra"]:
+            error = sqlite3.OperationalError("fake-password")
+            error.pgcode = invalid
+            self.assertEqual(app.auto_push_database_diagnostic(error),
+                             "type=OperationalError; sqlstate=unavailable; category=unknown")
+
+    def test_driver_subclass_and_unknown_type_names_are_not_echoed(self):
+        private_type = type("fake-password-private-host", (sqlite3.OperationalError,), {})
+        self.assertEqual(app.auto_push_database_diagnostic(private_type("private-user")),
+                         "type=OperationalError; sqlstate=unavailable; category=unknown")
+
+    def test_broken_exception_metadata_cannot_break_safe_diagnostics(self):
+        class BrokenError(Exception):
+            @property
+            def pgcode(self):
+                raise RuntimeError("fake-password")
+
+            def __str__(self):
+                raise RuntimeError("fake-password")
+
+        self.assertEqual(app.auto_push_database_diagnostic(BrokenError()),
+                         "type=Exception; sqlstate=unavailable; category=unknown")
 
 
 if __name__ == "__main__":

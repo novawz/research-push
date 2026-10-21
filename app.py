@@ -2191,6 +2191,73 @@ class AutoPushDatabaseError(RuntimeError):
     """A database failure that is safe to report without connection details."""
 
 
+def auto_push_database_diagnostic(exc: Exception) -> str:
+    """Return allowlisted metadata only; never include the driver error text."""
+    safe_types = {
+        "Exception", "RuntimeError", "ValueError", "TypeError", "OSError",
+        "TimeoutError", "ConnectionError", "ConnectionRefusedError", "PermissionError",
+        "FileNotFoundError", "Error", "Warning", "InterfaceError", "DatabaseError",
+        "DataError", "OperationalError", "IntegrityError", "InternalError",
+        "ProgrammingError", "NotSupportedError",
+    }
+    # Driver-specific subclasses fall back to their known DB-API parent type.
+    error_type = next((cls.__name__ for cls in type(exc).__mro__ if cls.__name__ in safe_types), "Exception")
+    try:
+        code = getattr(exc, "pgcode", None)
+    except Exception:
+        code = None
+    sqlstate = code if isinstance(code, str) and re.fullmatch(r"[0-9A-Z]{5}", code) else "unavailable"
+    category = {
+        "3D000": "database_missing",
+        "3F000": "schema",
+        "42P01": "schema",
+        "42703": "schema",
+        "42501": "permission",
+        "25006": "read_only",
+        "25001": "transaction_state",
+        "55P03": "lock_timeout",
+        "53300": "connection_limit",
+        "57P03": "database_unavailable",
+    }.get(sqlstate)
+    if sqlstate.startswith("28"):
+        category = "authentication"
+    if category is None:
+        # Text is inspected only for fixed categories, never returned or logged.
+        try:
+            message = str(exc).lower()
+        except Exception:
+            message = ""
+        patterns = (
+            ("authentication", ("password authentication failed", "authentication failed", "no password supplied", "tenant or user not found", "no pg_hba.conf entry")),
+            ("dns", ("could not translate host name", "name or service not known", "name resolution", "nodename nor servname", "getaddrinfo failed")),
+            ("configuration", ("invalid dsn", "invalid connection option", "unsupported startup parameter", "unrecognized configuration parameter")),
+            ("tls", ("ssl", "tls", "certificate verify failed")),
+            ("refused_or_unreachable", ("connection refused", "network is unreachable", "no route to host", "host is unreachable")),
+            ("lock_timeout", ("lock timeout", "database is locked")),
+            ("timeout", ("timeout", "timed out")),
+            ("schema", ("no such table", "no such column", "undefined table", "undefined column")),
+            ("read_only", ("read-only", "readonly", "read only transaction")),
+            ("permission", ("permission denied", "access denied")),
+            ("connection_limit", ("too many connections", "max client connections", "remaining connection slots")),
+            ("database_unavailable", ("database system is starting up", "database system is shutting down", "database system is in recovery")),
+            ("connection_failure", ("server closed the connection", "connection reset", "connection terminated unexpectedly")),
+            ("file_unavailable", ("unable to open database file",)),
+        )
+        category = next((label for label, fragments in patterns if any(fragment in message for fragment in fragments)), None)
+    if category is None:
+        if sqlstate.startswith("08"):
+            category = "connection_failure"
+        elif sqlstate == "57014":
+            category = "query_canceled"
+        elif isinstance(exc, TimeoutError):
+            category = "timeout"
+        elif isinstance(exc, ConnectionRefusedError):
+            category = "refused_or_unreachable"
+        else:
+            category = "unknown"
+    return f"type={error_type}; sqlstate={sqlstate}; category={category}"
+
+
 @contextmanager
 def auto_push_postgres_connection(*, readonly: bool = False):
     if psycopg2 is None:
@@ -2405,8 +2472,8 @@ def list_due_auto_push_subscriptions(now_dt: datetime | None = None) -> list[dic
                                 "last_run_local_date": row[6],
                             }
                         )
-        except Exception:
-            raise AutoPushDatabaseError("Cannot read auto-push subscriptions; check database connectivity and schema.") from None
+        except Exception as exc:
+            raise AutoPushDatabaseError(f"Cannot read auto-push subscriptions ({auto_push_database_diagnostic(exc)}).") from None
     elif AUTO_PUSH_BACKEND == "sqlite":
         try:
             # mode=ro also prevents --check from creating a missing database.
@@ -2421,8 +2488,8 @@ def list_due_auto_push_subscriptions(now_dt: datetime | None = None) -> list[dic
                     """
                 ).fetchall()
                 rows = [dict(r) for r in raw_rows]
-        except Exception:
-            raise AutoPushDatabaseError("Cannot read auto-push subscriptions; check database connectivity and schema.") from None
+        except Exception as exc:
+            raise AutoPushDatabaseError(f"Cannot read auto-push subscriptions ({auto_push_database_diagnostic(exc)}).") from None
     else:
         raise AutoPushDatabaseError("Auto-push backend unavailable.")
 
